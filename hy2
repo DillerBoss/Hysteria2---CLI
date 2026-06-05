@@ -1,0 +1,324 @@
+#!/bin/bash
+
+CONFIG="/etc/hysteria/config.yaml"
+CLIENTS_FILE="/etc/hysteria/clients.json"
+
+if [ "$EUID" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+
+# ─── Вспомогательные функции ───────────────────────────────────────
+
+get_server_ip() {
+    curl -s -4 ifconfig.me 2>/dev/null | tr -d '[:space:]'
+}
+
+get_port() {
+    grep '^listen:' "$CONFIG" | sed 's/listen: ://' | tr -d '[:space:]'
+}
+
+get_sni() {
+    grep 'url: https://' "$CONFIG" | sed 's/.*url: https:\/\///' | tr -d '[:space:]'
+}
+
+update_config() {
+    python3 -c "
+import json, re
+with open('$CLIENTS_FILE') as f:
+    clients = json.load(f)
+with open('$CONFIG') as f:
+    content = f.read()
+content = re.sub(r'auth:.*', '', content, flags=re.DOTALL).strip()
+if clients:
+    userpass = '\n'.join('    ' + k + ': ' + v for k, v in clients.items())
+    auth_block = '\n\nauth:\n  type: userpass\n  userpass:\n' + userpass + '\n'
+else:
+    auth_block = '\n\nauth:\n  type: userpass\n  userpass: {}\n'
+with open('$CONFIG', 'w') as f:
+    f.write(content + auth_block)
+"
+}
+
+restart_hysteria() {
+    systemctl restart hysteria-server > /dev/null 2>&1
+    sleep 1
+    if [ "$(systemctl is-active hysteria-server)" != "active" ]; then
+        echo "Ошибка: hysteria-server не запустился"
+        echo "Проверь: sudo systemctl status hysteria-server"
+        return 1
+    fi
+    return 0
+}
+
+# ─── Установка ─────────────────────────────────────────────────────
+
+do_install() {
+    echo ""
+    echo "  Установка Hysteria2"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Установка бинарника
+    bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка установки hysteria2"
+        exit 1
+    fi
+    echo "  [✓] Hysteria2 установлена"
+
+    # Выбор порта
+    DEFAULT_PORT=$((RANDOM + 10000))
+    echo ""
+    read -p "  Порт [$DEFAULT_PORT]: " INPUT_PORT
+    PORT=${INPUT_PORT:-$DEFAULT_PORT}
+
+    # Выбор SNI
+    echo ""
+    echo "  Выберите SNI домен:"
+    echo "    1. www.nvidia.com"
+    echo "    2. www.apple.com"
+    echo "    3. www.amazon.com"
+    echo "    4. www.cloudflare.com"
+    echo "    5. www.samsung.com"
+    echo "    6. Ввести свой"
+    echo ""
+    read -p "  Выбор [1]: " SNI_CHOICE
+    SNI_CHOICE=${SNI_CHOICE:-1}
+
+    case "$SNI_CHOICE" in
+        1) SNI="www.nvidia.com" ;;
+        2) SNI="www.apple.com" ;;
+        3) SNI="www.amazon.com" ;;
+        4) SNI="www.cloudflare.com" ;;
+        5) SNI="www.samsung.com" ;;
+        6) read -p "  Введите домен: " SNI ;;
+        *) SNI="www.nvidia.com" ;;
+    esac
+
+    echo ""
+    echo "  [✓] SNI: $SNI"
+
+    # Генерация сертификата
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout /etc/hysteria/server.key \
+        -out /etc/hysteria/server.crt \
+        -subj "/CN=${SNI}" -days 3650 2>/dev/null
+
+    chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt
+    chmod 640 /etc/hysteria/server.key /etc/hysteria/server.crt
+    echo "  [✓] Сертификат сгенерирован"
+
+    # Инициализация clients.json
+    echo "{}" > "$CLIENTS_FILE"
+
+    # Запись конфига
+    cat > "$CONFIG" << CONF
+listen: :${PORT}
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${SNI}
+    rewriteHost: true
+
+auth:
+  type: userpass
+  userpass: {}
+CONF
+
+    echo "  [✓] Конфиг записан (порт: $PORT)"
+
+    # Запуск
+    systemctl enable hysteria-server > /dev/null 2>&1
+    systemctl start hysteria-server > /dev/null 2>&1
+    sleep 1
+
+    if [ "$(systemctl is-active hysteria-server)" = "active" ]; then
+        echo "  [✓] Hysteria2 запущена"
+    else
+        echo "  [✗] Ошибка запуска. Проверь: sudo systemctl status hysteria-server"
+        exit 1
+    fi
+
+    echo ""
+    echo "  Установка завершена!"
+    show_help
+}
+
+# ─── Добавить клиента ───────────────────────────────────────────────
+
+do_add() {
+    SERVER_IP=$(get_server_ip)
+    PORT=$(get_port)
+    SNI=$(get_sni)
+
+    if [ ! -f "$CLIENTS_FILE" ]; then
+        echo "{}" > "$CLIENTS_FILE"
+    fi
+
+    echo ""
+    read -p "  Имя клиента: " CLIENT_NAME
+
+    if [ -z "$CLIENT_NAME" ]; then
+        echo "  Ошибка: имя не может быть пустым"
+        exit 1
+    fi
+
+    EXISTING=$(python3 -c "
+import json, sys
+with open('$CLIENTS_FILE') as f:
+    d = json.load(f)
+print(d.get(sys.argv[1], ''))
+" "$CLIENT_NAME" 2>/dev/null)
+
+    if [ -n "$EXISTING" ]; then
+        echo ""
+        echo "  Клиент '$CLIENT_NAME' уже существует"
+        echo ""
+        echo "  Ссылка: hy2://${CLIENT_NAME}:${EXISTING}@${SERVER_IP}:${PORT}?insecure=1&sni=${SNI}"
+        exit 0
+    fi
+
+    PASSWORD=$(openssl rand -hex 16)
+
+    python3 -c "
+import json, sys
+with open('$CLIENTS_FILE') as f:
+    data = json.load(f)
+data[sys.argv[1]] = sys.argv[2]
+with open('$CLIENTS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+" "$CLIENT_NAME" "$PASSWORD"
+
+    update_config
+    restart_hysteria || exit 1
+
+    echo ""
+    echo "  Клиент '$CLIENT_NAME' добавлен"
+    echo ""
+    echo "  Ссылка: hy2://${CLIENT_NAME}:${PASSWORD}@${SERVER_IP}:${PORT}?insecure=1&sni=${SNI}"
+}
+
+# ─── Список клиентов ────────────────────────────────────────────────
+
+do_list() {
+    SERVER_IP=$(get_server_ip)
+    PORT=$(get_port)
+    SNI=$(get_sni)
+
+    if [ ! -f "$CLIENTS_FILE" ]; then
+        echo "  Клиентов нет. Добавьте первого: hy2 add"
+        exit 0
+    fi
+
+    COUNT=$(python3 -c "import json; print(len(json.load(open('$CLIENTS_FILE'))))")
+
+    if [ "$COUNT" -eq 0 ]; then
+        echo "  Клиентов нет. Добавьте первого: hy2 add"
+        exit 0
+    fi
+
+    echo ""
+    echo "  Клиенты Hysteria2 (всего: $COUNT)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    python3 -c "
+import json, sys
+server_ip, server_port, sni = sys.argv[1], sys.argv[2], sys.argv[3]
+with open('$CLIENTS_FILE') as f:
+    clients = json.load(f)
+for name, password in clients.items():
+    link = 'hy2://' + name + ':' + password + '@' + server_ip + ':' + server_port + '?insecure=1&sni=' + sni
+    print('  ' + name)
+    print('  ' + link)
+    print()
+" "$SERVER_IP" "$PORT" "$SNI"
+}
+
+# ─── Удалить клиента ────────────────────────────────────────────────
+
+do_delete() {
+    if [ ! -f "$CLIENTS_FILE" ]; then
+        echo "  Клиентов нет."
+        exit 0
+    fi
+
+    echo ""
+    read -p "  Имя клиента для удаления: " CLIENT_NAME
+
+    if [ -z "$CLIENT_NAME" ]; then
+        echo "  Ошибка: имя не может быть пустым"
+        exit 1
+    fi
+
+    RESULT=$(python3 -c "
+import json, sys
+with open('$CLIENTS_FILE') as f:
+    data = json.load(f)
+name = sys.argv[1]
+if name not in data:
+    print('NOT_FOUND')
+else:
+    del data[name]
+    with open('$CLIENTS_FILE', 'w') as f:
+        json.dump(data, f, indent=2)
+    print('DELETED')
+" "$CLIENT_NAME")
+
+    if [ "$RESULT" = "NOT_FOUND" ]; then
+        echo "  Клиент '$CLIENT_NAME' не найден"
+        exit 1
+    fi
+
+    update_config
+    restart_hysteria || exit 1
+
+    echo "  Клиент '$CLIENT_NAME' удалён"
+}
+
+# ─── Статус ─────────────────────────────────────────────────────────
+
+do_status() {
+    STATUS=$(systemctl is-active hysteria-server)
+    PORT=$(get_port)
+    echo ""
+    echo "  Hysteria2 статус: $STATUS"
+    echo "  Порт: $PORT/UDP"
+    if [ "$STATUS" = "active" ]; then
+        echo "  Uptime: $(systemctl show hysteria-server --property=ActiveEnterTimestamp | cut -d= -f2)"
+    fi
+    echo ""
+}
+
+# ─── Справка ────────────────────────────────────────────────────────
+
+show_help() {
+    echo ""
+    echo "  Доступные команды:"
+    echo ""
+    echo "    hy2 add     — добавить клиента"
+    echo "    hy2 list    — список клиентов и ссылки"
+    echo "    hy2 del     — удалить клиента"
+    echo "    hy2 status  — статус сервера"
+    echo ""
+}
+
+# ─── Точка входа ────────────────────────────────────────────────────
+
+# Проверка установки
+if ! command -v hysteria &>/dev/null || [ ! -f "$CONFIG" ]; then
+    do_install
+    exit 0
+fi
+
+case "${1:-}" in
+    add)    do_add ;;
+    list)   do_list ;;
+    del)    do_delete ;;
+    status) do_status ;;
+    *)      show_help ;;
+esac
