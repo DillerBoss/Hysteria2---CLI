@@ -29,11 +29,8 @@ with open('$CLIENTS_FILE') as f:
 with open('$CONFIG') as f:
     content = f.read()
 content = re.sub(r'auth:.*', '', content, flags=re.DOTALL).strip()
-if clients:
-    userpass = '\n'.join('    ' + k + ': ' + v for k, v in clients.items())
-    auth_block = '\n\nauth:\n  type: userpass\n  userpass:\n' + userpass + '\n'
-else:
-    auth_block = '\n\nauth:\n  type: userpass\n  userpass: {}\n'
+userpass = '\n'.join('    ' + k + ': ' + v for k, v in clients.items())
+auth_block = '\n\nauth:\n  type: userpass\n  userpass:\n' + userpass + '\n'
 with open('$CONFIG', 'w') as f:
     f.write(content + auth_block)
 "
@@ -43,8 +40,8 @@ restart_hysteria() {
     systemctl restart hysteria-server > /dev/null 2>&1
     sleep 1
     if [ "$(systemctl is-active hysteria-server)" != "active" ]; then
-        echo "Ошибка: hysteria-server не запустился"
-        echo "Проверь: sudo systemctl status hysteria-server"
+        echo "  Ошибка: hysteria-server не запустился"
+        echo "  Проверь: sudo systemctl status hysteria-server"
         return 1
     fi
     return 0
@@ -57,21 +54,20 @@ do_install() {
     echo "  Установка Hysteria2"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Установка бинарника
     bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1
     if [ $? -ne 0 ]; then
-        echo "Ошибка установки hysteria2"
+        echo "  Ошибка установки hysteria2"
         exit 1
     fi
     echo "  [✓] Hysteria2 установлена"
 
-    # Выбор порта
+    # Порт
     DEFAULT_PORT=$((RANDOM + 10000))
     echo ""
     read -p "  Порт [$DEFAULT_PORT]: " INPUT_PORT
     PORT=${INPUT_PORT:-$DEFAULT_PORT}
 
-    # Выбор SNI
+    # SNI
     echo ""
     echo "  Выберите SNI домен:"
     echo "    1. www.nvidia.com"
@@ -93,24 +89,33 @@ do_install() {
         6) read -p "  Введите домен: " SNI ;;
         *) SNI="www.nvidia.com" ;;
     esac
-
-    echo ""
     echo "  [✓] SNI: $SNI"
 
-    # Генерация сертификата
+    # Сертификат
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout /etc/hysteria/server.key \
         -out /etc/hysteria/server.crt \
         -subj "/CN=${SNI}" -days 3650 2>/dev/null
-
     chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt
     chmod 640 /etc/hysteria/server.key /etc/hysteria/server.crt
     echo "  [✓] Сертификат сгенерирован"
 
-    # Инициализация clients.json
-    echo "{}" > "$CLIENTS_FILE"
+    # Первый клиент — обязателен для запуска
+    echo ""
+    echo "  Hysteria2 требует минимум одного клиента для запуска."
+    read -p "  Имя первого клиента [admin]: " FIRST_CLIENT
+    FIRST_CLIENT=${FIRST_CLIENT:-admin}
+    FIRST_PASS=$(openssl rand -hex 16)
 
-    # Запись конфига
+    # Инициализация clients.json с первым клиентом
+    python3 -c "
+import json
+data = {'$FIRST_CLIENT': '$FIRST_PASS'}
+with open('$CLIENTS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+
+    # Конфиг с первым клиентом
     cat > "$CONFIG" << CONF
 listen: :${PORT}
 
@@ -126,7 +131,8 @@ masquerade:
 
 auth:
   type: userpass
-  userpass: {}
+  userpass:
+    ${FIRST_CLIENT}: ${FIRST_PASS}
 CONF
 
     echo "  [✓] Конфиг записан (порт: $PORT)"
@@ -143,6 +149,10 @@ CONF
         exit 1
     fi
 
+    SERVER_IP=$(get_server_ip)
+    echo ""
+    echo "  Первый клиент: $FIRST_CLIENT"
+    echo "  Ссылка: hy2://${FIRST_CLIENT}:${FIRST_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${SNI}"
     echo ""
     echo "  Установка завершена!"
     show_help
@@ -210,14 +220,14 @@ do_list() {
     SNI=$(get_sni)
 
     if [ ! -f "$CLIENTS_FILE" ]; then
-        echo "  Клиентов нет. Добавьте первого: hy2 add"
+        echo "  Клиентов нет. Добавьте: hy2 add"
         exit 0
     fi
 
     COUNT=$(python3 -c "import json; print(len(json.load(open('$CLIENTS_FILE'))))")
 
     if [ "$COUNT" -eq 0 ]; then
-        echo "  Клиентов нет. Добавьте первого: hy2 add"
+        echo "  Клиентов нет. Добавьте: hy2 add"
         exit 0
     fi
 
@@ -245,6 +255,13 @@ do_delete() {
     if [ ! -f "$CLIENTS_FILE" ]; then
         echo "  Клиентов нет."
         exit 0
+    fi
+
+    COUNT=$(python3 -c "import json; print(len(json.load(open('$CLIENTS_FILE'))))")
+    if [ "$COUNT" -le 1 ]; then
+        echo "  Нельзя удалить последнего клиента — Hysteria2 требует минимум одного."
+        echo "  Сначала добавьте нового: hy2 add"
+        exit 1
     fi
 
     echo ""
@@ -286,11 +303,14 @@ do_status() {
     STATUS=$(systemctl is-active hysteria-server)
     PORT=$(get_port)
     echo ""
-    echo "  Hysteria2 статус: $STATUS"
-    echo "  Порт: $PORT/UDP"
+    echo "  Hysteria2 статус : $STATUS"
+    echo "  Порт             : $PORT/UDP"
     if [ "$STATUS" = "active" ]; then
-        echo "  Uptime: $(systemctl show hysteria-server --property=ActiveEnterTimestamp | cut -d= -f2)"
+        UPTIME=$(systemctl show hysteria-server --property=ActiveEnterTimestamp | cut -d= -f2)
+        echo "  Запущен с        : $UPTIME"
     fi
+    COUNT=$(python3 -c "import json; print(len(json.load(open('$CLIENTS_FILE'))))" 2>/dev/null || echo 0)
+    echo "  Клиентов         : $COUNT"
     echo ""
 }
 
@@ -309,7 +329,6 @@ show_help() {
 
 # ─── Точка входа ────────────────────────────────────────────────────
 
-# Проверка установки
 if ! command -v hysteria &>/dev/null || [ ! -f "$CONFIG" ]; then
     do_install
     exit 0
