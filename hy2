@@ -68,29 +68,43 @@ print_links() {
     echo "  hy2://${NAME}:${PASS}@${SERVER_IP}:${PORT}?pinSHA256=${FP}&sni=${SNI}#${NAME} (iOS)"
 }
 
-# ─── Установка ─────────────────────────────────────────────────────
+regen_cert() {
+    local SNI="$1"
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout /etc/hysteria/server.key \
+        -out "$CERT" \
+        -subj "/CN=${SNI}" -days 3650 2>/dev/null
+    chown hysteria:hysteria /etc/hysteria/server.key "$CERT"
+    chmod 640 /etc/hysteria/server.key "$CERT"
+}
+
+# ─── Установка / Обновление ────────────────────────────────────────
 
 do_install() {
     echo ""
-    echo "  Установка Hysteria2"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Проверка — установлена ли уже
-    if command -v hysteria &>/dev/null; then
+    # Если уже установлена — обновляем
+    if command -v hysteria &>/dev/null && [ -f "$CONFIG" ]; then
+        echo "  Обновление Hysteria2"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         CURRENT=$(hysteria version 2>/dev/null | grep -oP 'v\d+\.\d+\.\d+' | head -1)
-        echo "  Hysteria2 уже установлена ($CURRENT)"
-        echo "  Обновляю до последней версии..."
+        echo "  Текущая версия: $CURRENT"
+        echo "  Обновляю..."
         bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1
         NEW=$(hysteria version 2>/dev/null | grep -oP 'v\d+\.\d+\.\d+' | head -1)
         if [ "$CURRENT" = "$NEW" ]; then
             echo "  [✓] Версия актуальна ($NEW)"
         else
             echo "  [✓] Обновлено: $CURRENT → $NEW"
-            systemctl restart hysteria-server > /dev/null 2>&1
+            restart_hysteria
         fi
         show_help
         return
     fi
+
+    # Свежая установка
+    echo "  Установка Hysteria2"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1
     if [ $? -ne 0 ]; then
@@ -117,7 +131,6 @@ do_install() {
     echo ""
     read -p "  Выбор [1]: " SNI_CHOICE
     SNI_CHOICE=${SNI_CHOICE:-1}
-
     case "$SNI_CHOICE" in
         1) SNI="www.nvidia.com" ;;
         2) SNI="www.apple.com" ;;
@@ -130,12 +143,7 @@ do_install() {
     echo "  [✓] SNI: $SNI"
 
     # Сертификат
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-        -keyout /etc/hysteria/server.key \
-        -out "$CERT" \
-        -subj "/CN=${SNI}" -days 3650 2>/dev/null
-    chown hysteria:hysteria /etc/hysteria/server.key "$CERT"
-    chmod 640 /etc/hysteria/server.key "$CERT"
+    regen_cert "$SNI"
     echo "  [✓] Сертификат сгенерирован"
 
     # Первый клиент
@@ -281,8 +289,8 @@ server_ip, server_port, sni, fp = sys.argv[1], sys.argv[2], sys.argv[3], sys.arg
 with open('$CLIENTS_FILE') as f:
     clients = json.load(f)
 for name, password in clients.items():
-    std  = 'hy2://' + name + ':' + password + '@' + server_ip + ':' + server_port + '?insecure=1&sni=' + sni + '#' + name
-    ios  = 'hy2://' + name + ':' + password + '@' + server_ip + ':' + server_port + '?pinSHA256=' + fp + '&sni=' + sni + '#' + name + ' (iOS)'
+    std = 'hy2://' + name + ':' + password + '@' + server_ip + ':' + server_port + '?insecure=1&sni=' + sni + '#' + name
+    ios = 'hy2://' + name + ':' + password + '@' + server_ip + ':' + server_port + '?pinSHA256=' + fp + '&sni=' + sni + '#' + name + ' (iOS)'
     print()
     print('  ' + name)
     print('  Стандартная : ' + std)
@@ -339,16 +347,74 @@ else:
     echo "  Клиент '$CLIENT_NAME' удалён"
 }
 
+# ─── Смена SNI ──────────────────────────────────────────────────────
+
+do_sni() {
+    CURRENT_SNI=$(get_sni)
+    echo ""
+    echo "  Текущий SNI: $CURRENT_SNI"
+    echo ""
+    echo "  Выберите новый SNI домен:"
+    echo "    1. www.nvidia.com"
+    echo "    2. www.apple.com"
+    echo "    3. www.amazon.com"
+    echo "    4. www.cloudflare.com"
+    echo "    5. www.samsung.com"
+    echo "    6. Ввести свой"
+    echo ""
+    read -p "  Выбор [1]: " SNI_CHOICE
+    SNI_CHOICE=${SNI_CHOICE:-1}
+    case "$SNI_CHOICE" in
+        1) NEW_SNI="www.nvidia.com" ;;
+        2) NEW_SNI="www.apple.com" ;;
+        3) NEW_SNI="www.amazon.com" ;;
+        4) NEW_SNI="www.cloudflare.com" ;;
+        5) NEW_SNI="www.samsung.com" ;;
+        6) read -p "  Введите домен: " NEW_SNI ;;
+        *) NEW_SNI="www.nvidia.com" ;;
+    esac
+
+    if [ "$NEW_SNI" = "$CURRENT_SNI" ]; then
+        echo "  SNI не изменился ($CURRENT_SNI)"
+        exit 0
+    fi
+
+    # Меняем SNI в конфиге
+    python3 -c "
+import sys
+new_sni = sys.argv[1]
+with open('$CONFIG') as f:
+    content = f.read()
+import re
+content = re.sub(r'url: https://[^\s]+', 'url: https://' + new_sni, content)
+with open('$CONFIG', 'w') as f:
+    f.write(content)
+" "$NEW_SNI"
+
+    # Перегенерируем сертификат
+    regen_cert "$NEW_SNI"
+    echo "  [✓] Сертификат перегенерирован"
+
+    restart_hysteria || exit 1
+
+    echo "  [✓] SNI обновлён: $CURRENT_SNI → $NEW_SNI"
+    echo ""
+    echo "  Внимание: iOS-ссылки (pinSHA256) изменились — обновите их у клиентов."
+    echo "  Запустите: hy2 list"
+}
+
 # ─── Статус ─────────────────────────────────────────────────────────
 
 do_status() {
     STATUS=$(systemctl is-active hysteria-server)
     PORT=$(get_port)
+    SNI=$(get_sni)
     COUNT=$(python3 -c "import json; print(len(json.load(open('$CLIENTS_FILE'))))" 2>/dev/null || echo 0)
     UPTIME=$(systemctl show hysteria-server --property=ActiveEnterTimestamp | cut -d= -f2)
     echo ""
     echo "  Hysteria2 статус : $STATUS"
     echo "  Порт             : $PORT/UDP"
+    echo "  SNI              : $SNI"
     echo "  Клиентов         : $COUNT"
     [ "$STATUS" = "active" ] && echo "  Запущен с        : $UPTIME"
     echo ""
@@ -364,6 +430,7 @@ show_help() {
     echo "    hy2 list      — список клиентов и ссылки"
     echo "    hy2 del       — удалить клиента"
     echo "    hy2 status    — статус сервера"
+    echo "    hy2 sni       — сменить SNI домен"
     echo "    hy2 update    — обновить Hysteria2"
     echo ""
 }
@@ -380,6 +447,7 @@ case "${1:-}" in
     list)   do_list ;;
     del)    do_delete ;;
     status) do_status ;;
+    sni)    do_sni ;;
     update) do_install ;;
     *)      show_help ;;
 esac
