@@ -420,6 +420,58 @@ do_status() {
     echo ""
 }
 
+# ─── Полное удаление ────────────────────────────────────────────────
+
+do_remove() {
+    echo ""
+    echo "  Удаление Hysteria2"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  Будет удалено:"
+    echo "    - hysteria бинарник (/usr/local/bin/hysteria)"
+    echo "    - конфиг и сертификаты (/etc/hysteria/)"
+    echo "    - systemd сервис"
+    echo "    - данные клиентов ($CLIENTS_FILE)"
+    echo "    - скрипт управления (/usr/local/bin/hy2)"
+    echo ""
+    read -p "  Вы уверены? Введите YES для подтверждения: " CONFIRM
+
+    if [ "$CONFIRM" != "YES" ]; then
+        echo "  Отменено."
+        exit 0
+    fi
+
+    # Останавливаем и отключаем сервис
+    systemctl stop hysteria-server > /dev/null 2>&1
+    systemctl disable hysteria-server > /dev/null 2>&1
+    echo "  [✓] Сервис остановлен"
+
+    # Удаляем systemd юниты
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /etc/systemd/system/hysteria-server@.service
+    systemctl daemon-reload > /dev/null 2>&1
+    echo "  [✓] Systemd юниты удалены"
+
+    # Удаляем бинарник
+    rm -f /usr/local/bin/hysteria
+    echo "  [✓] Бинарник удалён"
+
+    # Удаляем конфиг, сертификаты и данные клиентов
+    rm -rf /etc/hysteria/
+    echo "  [✓] Конфиг и сертификаты удалены"
+
+    # Удаляем пользователя hysteria если создавался
+    if id hysteria &>/dev/null; then
+        userdel hysteria > /dev/null 2>&1
+        echo "  [✓] Пользователь hysteria удалён"
+    fi
+
+    # Удаляем сам скрипт hy2 последним
+    echo "  [✓] Удаление завершено"
+    echo ""
+    rm -f /usr/local/bin/hy2
+}
+
 # ─── Справка ────────────────────────────────────────────────────────
 
 show_help() {
@@ -432,6 +484,7 @@ show_help() {
     echo "    hy2 status    — статус сервера"
     echo "    hy2 sni       — сменить SNI домен"
     echo "    hy2 update    — обновить Hysteria2"
+    echo "    hy2 remove    — полностью удалить Hysteria2"
     echo ""
 }
 
@@ -449,5 +502,6 @@ case "${1:-}" in
     status) do_status ;;
     sni)    do_sni ;;
     update) do_install ;;
+    remove) do_remove ;;
     *)      show_help ;;
 esac
